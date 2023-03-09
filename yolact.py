@@ -8,9 +8,10 @@ from math import sqrt
 from typing import List
 from collections import defaultdict
 
-from layers import Detect
 from data.config import cfg
+from layers.box_utils import decode
 from layers.interpolate import InterpolateModule
+from layers.nms_utils import cc_fast_nms, fast_nms, traditional_nms
 from backbone import construct_backbone
 
 import torch.backends.cudnn as cudnn
@@ -455,10 +456,6 @@ class Yolact(nn.Module):
         if cfg.use_semantic_segmentation_loss:
             self.semantic_seg_conv = nn.Conv2d(src_channels[0], cfg.num_classes-1, kernel_size=1)
 
-        # For use in evaluation
-        self.detect = Detect(cfg.num_classes, bkg_label=0, top_k=cfg.nms_top_k,
-            conf_thresh=cfg.nms_conf_thresh, nms_thresh=cfg.nms_thresh)
-
     def save_weights(self, path):
         """ Saves the model's weights using compression because the file sizes were getting too big. """
         torch.save(self.state_dict(), path)
@@ -654,8 +651,56 @@ class Yolact(nn.Module):
                 else:
                     pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
 
-            return self.detect(pred_outs, self)
+            loc_data   = predictions['loc']
+            conf_data  = predictions['conf']
+            mask_data  = predictions['mask']
+            prior_data = predictions['priors']
 
+            proto_data = predictions['proto'] if 'proto' in predictions else None
+
+            out = []
+
+            with timer.env('nms'):
+                batch_size = loc_data.size(0)
+                num_priors = loc_data.size(1)
+
+                conf_preds = conf_data.view(batch_size, num_priors, cfg.num_classes).transpose(2, 1).contiguous()
+
+                for batch_idx in range(batch_size):
+                    decoded_boxes = decode(loc_data[batch_idx], prior_data)
+
+                    # Perform NMS for only the max scoring class that isn't background (class 0)
+                    cur_scores = conf_preds[batch_idx, 1:, :]
+                    conf_scores, _ = torch.max(cur_scores, dim=0)
+
+                    keep = (conf_scores > cfg.nms_conf_thresh)
+                    scores = cur_scores[:, keep]
+                    boxes = decoded_boxes[keep, :]
+                    masks = mask_data[batch_idx, keep, :]
+
+                    if scores.size(1) == 0:
+                        return None
+
+                    if cfg.use_fast_nms:
+                        if cfg.use_cross_class_nms:
+                            boxes, masks, classes, scores = cc_fast_nms(boxes, masks, scores,
+                                cfg.nms_thresh, cfg.nms_top_k, cfg.nms_conf_thresh, cfg.max_num_detections)
+                        else:
+                            boxes, masks, classes, scores = fast_nms(boxes, masks, scores,
+                                cfg.nms_thresh, cfg.nms_top_k, cfg.nms_conf_thresh, cfg.max_num_detections)
+                    else:
+                        boxes, masks, classes, scores = traditional_nms(boxes, masks, scores,
+                            cfg.nms_thresh, cfg.nms_top_k, cfg.nms_conf_thresh, cfg.max_num_detections, cfg.max_size)
+                        if cfg.use_cross_class_nms:
+                            print('Warning: Cross Class Traditional NMS is not implemented.')
+
+                    result = {'box': boxes, 'mask': masks, 'class': classes, 'score': scores}
+                    if result is not None and proto_data is not None:
+                        result['proto'] = proto_data[batch_idx]
+
+                    out.append({'detection': result, 'net': net})
+            
+            return out
 
 
 
