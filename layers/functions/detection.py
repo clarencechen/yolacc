@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from ..box_utils import decode, jaccard, index2d
 from utils import timer
 
-from data import cfg, mask_type
+from data import cfg
 
 import numpy as np
 
@@ -40,7 +40,7 @@ class Detect(object):
                 Shape: [batch, num_priors, mask_dim]
             prior_data: (tensor) Prior boxes and variances from priorbox layers
                 Shape: [num_priors, 4]
-            proto_data: (tensor) If using mask_type.lincomb, the prototype masks
+            proto_data: (tensor) If predicting masks, the prototype masks
                 Shape: [batch, mask_h, mask_w, mask_dim]
         
         Returns:

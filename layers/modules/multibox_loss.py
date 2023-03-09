@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from ..box_utils import match, log_sum_exp, decode, center_size, crop, elemwise_mask_iou, elemwise_box_iou
 
-from data import cfg, mask_type, activation_func
+from data import cfg, activation_func
 
 class MultiBoxLoss(nn.Module):
     """SSD Weighted Loss Function
@@ -56,7 +56,7 @@ class MultiBoxLoss(nn.Module):
                 conf shape: torch.size(batch_size,num_priors,num_classes)
                 masks shape: torch.size(batch_size,num_priors,mask_dim)
                 priors shape: torch.size(num_priors,4)
-                proto* shape: torch.size(batch_size,mask_h,mask_w,mask_dim)
+                proto shape: torch.size(batch_size,mask_h,mask_w,mask_dim)
 
             targets (list<tensor>): Ground truth boxes and labels for a batch,
                 shape: [batch_size][num_objs,5] (last idx is the label).
@@ -66,8 +66,6 @@ class MultiBoxLoss(nn.Module):
 
             num_crowds (list<int>): Number of crowd annotations per batch. The crowd
                 annotations should be the last num_crowds elements of targets and masks.
-            
-            * Only if mask_type == lincomb
         """
 
         loc_data  = predictions['loc']
@@ -75,10 +73,8 @@ class MultiBoxLoss(nn.Module):
         mask_data = predictions['mask']
         priors    = predictions['priors']
 
-        if cfg.mask_type == mask_type.lincomb:
-            proto_data = predictions['proto']
+        proto_data = predictions['proto']
 
-        score_data = predictions['score'] if cfg.use_mask_scoring   else None   
         inst_data  = predictions['inst']  if cfg.use_instance_coeff else None
         
         labels = [None] * len(targets) # Used in sem segm loss
@@ -145,29 +141,18 @@ class MultiBoxLoss(nn.Module):
             losses['B'] = F.smooth_l1_loss(loc_p, loc_t, reduction='sum') * cfg.bbox_alpha
 
         if cfg.train_masks:
-            if cfg.mask_type == mask_type.direct:
-                if cfg.use_gt_bboxes:
-                    pos_masks = []
-                    for idx in range(batch_size):
-                        pos_masks.append(masks[idx][idx_t[idx, pos[idx]]])
-                    masks_t = torch.cat(pos_masks, 0)
-                    masks_p = mask_data[pos, :].view(-1, cfg.mask_dim)
-                    losses['M'] = F.binary_cross_entropy(torch.clamp(masks_p, 0, 1), masks_t, reduction='sum') * cfg.mask_alpha
-                else:
-                    losses['M'] = self.direct_mask_loss(pos_idx, idx_t, loc_data, mask_data, priors, masks)
-            elif cfg.mask_type == mask_type.lincomb:
-                ret = self.lincomb_mask_loss(pos, idx_t, loc_data, mask_data, priors, proto_data, masks, gt_box_t, score_data, inst_data, labels)
-                if cfg.use_maskiou:
-                    loss, maskiou_targets = ret
-                else:
-                    loss = ret
-                losses.update(loss)
+            ret = self.lincomb_mask_loss(pos, idx_t, loc_data, mask_data, priors, proto_data, masks, gt_box_t, inst_data, labels)
+            if cfg.use_maskiou:
+                loss, maskiou_targets = ret
+            else:
+                loss = ret
+            losses.update(loss)
 
-                if cfg.mask_proto_loss is not None:
-                    if cfg.mask_proto_loss == 'l1':
-                        losses['P'] = torch.mean(torch.abs(proto_data)) / self.l1_expected_area * self.l1_alpha
-                    elif cfg.mask_proto_loss == 'disj':
-                        losses['P'] = -torch.mean(torch.max(F.log_softmax(proto_data, dim=-1), dim=-1)[0])
+            if cfg.mask_proto_loss is not None:
+                if cfg.mask_proto_loss == 'l1':
+                    losses['P'] = torch.mean(torch.abs(proto_data)) / self.l1_expected_area * self.l1_alpha
+                elif cfg.mask_proto_loss == 'disj':
+                    losses['P'] = -torch.mean(torch.max(F.log_softmax(proto_data, dim=-1), dim=-1)[0])
 
         # Confidence loss
         if cfg.use_focal_loss:
@@ -426,50 +411,6 @@ class MultiBoxLoss(nn.Module):
         class_loss = F.cross_entropy(conf_data_pos, conf_t_pos, reduction='sum')
 
         return cfg.conf_alpha * (class_loss + obj_pos_loss + obj_neg_loss)
-
-
-    def direct_mask_loss(self, pos_idx, idx_t, loc_data, mask_data, priors, masks):
-        """ Crops the gt masks using the predicted bboxes, scales them down, and outputs the BCE loss. """
-        loss_m = 0
-        for idx in range(mask_data.size(0)):
-            with torch.no_grad():
-                cur_pos_idx = pos_idx[idx, :, :]
-                cur_pos_idx_squeezed = cur_pos_idx[:, 1]
-
-                # Shape: [num_priors, 4], decoded predicted bboxes
-                pos_bboxes = decode(loc_data[idx, :, :], priors.data, cfg.use_yolo_regressors)
-                pos_bboxes = pos_bboxes[cur_pos_idx].view(-1, 4).clamp(0, 1)
-                pos_lookup = idx_t[idx, cur_pos_idx_squeezed]
-
-                cur_masks = masks[idx]
-                pos_masks = cur_masks[pos_lookup, :, :]
-                
-                # Convert bboxes to absolute coordinates
-                num_pos, img_height, img_width = pos_masks.size()
-
-                # Take care of all the bad behavior that can be caused by out of bounds coordinates
-                x1, x2 = sanitize_coordinates(pos_bboxes[:, 0], pos_bboxes[:, 2], img_width)
-                y1, y2 = sanitize_coordinates(pos_bboxes[:, 1], pos_bboxes[:, 3], img_height)
-
-                # Crop each gt mask with the predicted bbox and rescale to the predicted mask size
-                # Note that each bounding box crop is a different size so I don't think we can vectorize this
-                scaled_masks = []
-                for jdx in range(num_pos):
-                    tmp_mask = pos_masks[jdx, y1[jdx]:y2[jdx], x1[jdx]:x2[jdx]]
-
-                    # Restore any dimensions we've left out because our bbox was 1px wide
-                    while tmp_mask.dim() < 2:
-                        tmp_mask = tmp_mask.unsqueeze(0)
-
-                    new_mask = F.adaptive_avg_pool2d(tmp_mask.unsqueeze(0), cfg.mask_size)
-                    scaled_masks.append(new_mask.view(1, -1))
-
-                mask_t = torch.cat(scaled_masks, 0).gt(0.5).float() # Threshold downsampled mask
-            
-            pos_mask_data = mask_data[idx, cur_pos_idx_squeezed, :]
-            loss_m += F.binary_cross_entropy(torch.clamp(pos_mask_data, 0, 1), mask_t, reduction='sum') * cfg.mask_alpha
-
-        return loss_m
     
 
     def coeff_diversity_loss(self, coeffs, instance_t):
@@ -496,7 +437,7 @@ class MultiBoxLoss(nn.Module):
         return cfg.mask_proto_coeff_diversity_alpha * loss.sum() / num_pos
 
 
-    def lincomb_mask_loss(self, pos, idx_t, loc_data, mask_data, priors, proto_data, masks, gt_box_t, score_data, inst_data, labels, interpolation_mode='bilinear'):
+    def lincomb_mask_loss(self, pos, idx_t, loc_data, mask_data, priors, proto_data, masks, gt_box_t, inst_data, labels, interpolation_mode='bilinear'):
         mask_h = proto_data.size(1)
         mask_w = proto_data.size(2)
 
@@ -557,8 +498,6 @@ class MultiBoxLoss(nn.Module):
 
             proto_masks = proto_data[idx]
             proto_coef  = mask_data[idx, cur_pos, :]
-            if cfg.use_mask_scoring:
-                mask_scores = score_data[idx, cur_pos, :]
 
             if cfg.mask_proto_coeff_diversity_loss:
                 if inst_data is not None:
@@ -579,8 +518,6 @@ class MultiBoxLoss(nn.Module):
                 
                 if process_gt_bboxes:
                     pos_gt_box_t = pos_gt_box_t[select, :]
-                if cfg.use_mask_scoring:
-                    mask_scores = mask_scores[select, :]
 
             num_pos = proto_coef.size(0)
             mask_t = downsampled_masks[:, :, pos_idx_t]     

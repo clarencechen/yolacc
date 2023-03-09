@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 
-from data import cfg, mask_type, MEANS, STD, activation_func
+from data import cfg, MEANS, STD, activation_func
 from utils.augmentations import Resize
 from utils import timer
 from .box_utils import crop, sanitize_coordinates
@@ -55,7 +55,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     scores  = dets['score']
     masks   = dets['mask']
 
-    if cfg.mask_type == mask_type.lincomb and cfg.eval_mask_branch:
+    if cfg.eval_mask_branch:
         # At this points masks is only the coefficients
         proto_data = dets['proto']
         
@@ -97,27 +97,6 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     boxes[:, 0], boxes[:, 2] = sanitize_coordinates(boxes[:, 0], boxes[:, 2], w, cast=False)
     boxes[:, 1], boxes[:, 3] = sanitize_coordinates(boxes[:, 1], boxes[:, 3], h, cast=False)
     boxes = boxes.long()
-
-    if cfg.mask_type == mask_type.direct and cfg.eval_mask_branch:
-        # Upscale masks
-        full_masks = torch.zeros(masks.size(0), h, w)
-
-        for jdx in range(masks.size(0)):
-            x1, y1, x2, y2 = boxes[jdx, :]
-
-            mask_w = x2 - x1
-            mask_h = y2 - y1
-
-            # Just in case
-            if mask_w * mask_h <= 0 or mask_w < 0:
-                continue
-            
-            mask = masks[jdx, :].view(1, 1, cfg.mask_size, cfg.mask_size)
-            mask = F.interpolate(mask, (mask_h, mask_w), mode=interpolation_mode, align_corners=False)
-            mask = mask.gt(0.5).float()
-            full_masks[jdx, y1:y2, x1:x2] = mask
-        
-        masks = full_masks
 
     return classes, scores, boxes, masks
 
